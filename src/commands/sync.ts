@@ -1038,7 +1038,9 @@ async function performFullSync(
   if (fullConcurrency > 1) importArgs.push('--workers', String(fullConcurrency));
   const scopeRel = relative(gitContextRoot, syncScopeRoot);
   const slugRoot = scopeRel ? gitContextRoot : undefined;
-  const result = await runImport(engine, importArgs, { commit: headCommit, exclude: opts.exclude, slugRoot });
+  // v0.30.x follow-up to PR #707: thread sourceId through runImport so
+  // performFullSync routes pages to the named source.
+  const result = await runImport(engine, importArgs, { commit: headCommit, exclude: opts.exclude, slugRoot, sourceId: opts.sourceId });
 
   // Bug 9 — gate the full-sync bookmark on success. runImport already
   // writes its own sync.last_commit conditionally (import.ts), but
