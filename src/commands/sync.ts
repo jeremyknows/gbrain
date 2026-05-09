@@ -1036,8 +1036,14 @@ async function performFullSync(
   const importArgs = [syncScopeRoot];
   if (opts.noEmbed) importArgs.push('--no-embed');
   if (fullConcurrency > 1) importArgs.push('--workers', String(fullConcurrency));
+  // Use git-root-relative slugs ONLY when --src-subpath was explicitly
+  // provided. Sources registered with a direct subdirectory path (e.g.
+  // wiki → ~/atlas/shared/wiki) expect slugs relative to that path, not
+  // the git root — they may carry frontmatter slug: fields matching the
+  // old path-relative convention. The --src-subpath monorepo case is the
+  // only place git-root-relative slugs are intentional.
   const scopeRel = relative(gitContextRoot, syncScopeRoot);
-  const slugRoot = scopeRel ? gitContextRoot : undefined;
+  const slugRoot = (opts.srcSubpath && scopeRel) ? gitContextRoot : undefined;
   // v0.30.x follow-up to PR #707: thread sourceId through runImport so
   // performFullSync routes pages to the named source.
   const result = await runImport(engine, importArgs, { commit: headCommit, exclude: opts.exclude, slugRoot, sourceId: opts.sourceId });
