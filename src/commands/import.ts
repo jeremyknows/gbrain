@@ -28,7 +28,7 @@ export interface RunImportResult {
   failures: Array<{ path: string; error: string }>;
 }
 
-export async function runImport(engine: BrainEngine, args: string[], opts: { commit?: string } = {}): Promise<RunImportResult> {
+export async function runImport(engine: BrainEngine, args: string[], opts: { commit?: string; exclude?: string[]; slugRoot?: string } = {}): Promise<RunImportResult> {
   const noEmbed = args.includes('--no-embed');
   const fresh = args.includes('--fresh');
   const jsonOutput = args.includes('--json');
@@ -58,19 +58,28 @@ export async function runImport(engine: BrainEngine, args: string[], opts: { com
 
   // Collect all .md files
   const allFiles = collectMarkdownFiles(dir);
-  console.log(`Found ${allFiles.length} markdown files`);
+
+  // Apply exclude patterns from opts (passed by performFullSync for --exclude support)
+  let filteredFiles = allFiles;
+  if (opts.exclude && opts.exclude.length > 0) {
+    const { matchesAnyGlob } = await import('../core/sync.ts');
+    filteredFiles = allFiles.filter(abs => !matchesAnyGlob(relative(dir, abs), opts.exclude!));
+    console.log(`Found ${filteredFiles.length} markdown files (${allFiles.length - filteredFiles.length} excluded by --exclude patterns)`);
+  } else {
+    console.log(`Found ${allFiles.length} markdown files`);
+  }
 
   // Resume from checkpoint if available
   const checkpointPath = gbrainPath('import-checkpoint.json');
-  let files = allFiles;
+  let files = filteredFiles;
   let resumeIndex = 0;
 
   if (!fresh && existsSync(checkpointPath)) {
     try {
       const cp = JSON.parse(readFileSync(checkpointPath, 'utf-8'));
-      if (cp.dir === dir && cp.totalFiles === allFiles.length) {
+      if (cp.dir === dir && cp.totalFiles === filteredFiles.length) {
         resumeIndex = cp.processedIndex;
-        files = allFiles.slice(resumeIndex);
+        files = filteredFiles.slice(resumeIndex);
         console.log(`Resuming from checkpoint: skipping ${resumeIndex} already-processed files`);
       }
     } catch {
@@ -102,8 +111,10 @@ export async function runImport(engine: BrainEngine, args: string[], opts: { com
     progress.tick(1, `imported=${imported} skipped=${skipped} errors=${errors}`);
   }
 
+  const slugBase = opts.slugRoot ?? dir;
+
   async function processFile(eng: BrainEngine, filePath: string) {
-    const relativePath = relative(dir, filePath);
+    const relativePath = relative(slugBase, filePath);
     try {
       // v0.27.1 (F2): dispatch image extensions to importImageFile when
       // multimodal is enabled. The walker (collectMarkdownFiles) only picks
