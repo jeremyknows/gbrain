@@ -209,6 +209,34 @@ describe('gbrain extract --stale', () => {
     expect(usRows[0]?.eq).toBe(true);
   });
 
+  test('CRITICAL (version-arm floor): pre-bump updated_at clears after --stale (no permanent re-extraction)', async () => {
+    // Live repro 2026-07-05: 2,973 pages last updated BEFORE
+    // LINK_EXTRACTOR_VERSION_TS re-extracted on every sweep forever. The D4
+    // stamp used the read updated_at verbatim, so links_extracted_at stayed
+    // < versionTs and the version arm re-marked the page stale immediately.
+    await engine.putPage('people/alice', personPage('Alice'));
+    await engine.putPage('companies/acme', companyPage('Acme', 'No links here.'));
+    // Push updated_at BEFORE the extractor version bump so the version arm is
+    // the arm under test (the stamp must floor to versionTs to clear it).
+    await engine.executeRaw(`UPDATE pages SET updated_at = '2026-04-01 12:00:00.123456+00'`);
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(2);
+
+    await runExtract(engine, ['--stale']);
+    // Fixed: stamped at max(updated_at, versionTs) — both arms clear.
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+
+    // And it STAYS cleared on a re-run (the observed symptom was the count
+    // never dropping across repeated sweeps).
+    await runExtract(engine, ['--stale']);
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+
+    // The stamp floored to the version constant, not the ancient updated_at.
+    const rows = await engine.executeRaw<{ ok: boolean }>(
+      `SELECT links_extracted_at >= '2026-05-31T00:00:00Z'::timestamptz AS ok FROM pages WHERE slug = 'companies/acme'`,
+    );
+    expect(rows[0]?.ok).toBe(true);
+  });
+
   test('CDX-4 (D2): a link-flush throw aborts the sweep and leaves pages UNSTAMPED', async () => {
     await engine.putPage('people/alice', personPage('Alice'));
     await engine.putPage('companies/acme', companyPage('Acme', '[Alice](people/alice) founded [Acme](companies/acme).'));

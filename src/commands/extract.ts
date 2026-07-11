@@ -1675,7 +1675,18 @@ async function extractStaleFromDB(
       // `page.updated_at.toISOString()` — the JS Date is ms-truncated, so the
       // µs-precision DB updated_at stayed strictly greater and the page never
       // cleared on Postgres. Stamping the exact value makes them equal.
-      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt: page.updated_at_iso });
+      //
+      // Version-arm floor: for pages whose updated_at predates
+      // LINK_EXTRACTOR_VERSION_TS, stamping the read updated_at leaves
+      // links_extracted_at < versionTs — the version arm re-marks them stale
+      // forever (observed live 2026-07-05: 2,973 pre-bump pages re-extracting
+      // on every sweep, count never dropping). Stamp max(updated_at, versionTs):
+      // the version arm clears, and the D4 race property is preserved because
+      // any concurrent edit lands at now(), strictly after the constant.
+      const stampAt = new Date(page.updated_at_iso).getTime() >= new Date(versionTs).getTime()
+        ? page.updated_at_iso
+        : versionTs;
+      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt: stampAt });
     }
 
     // Flush NON-swallowing (CDX-4): a throw here propagates out of the sweep so
