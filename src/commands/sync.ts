@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, statSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, statSync, realpathSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join, relative } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
@@ -8,6 +8,7 @@ import { collectSyncableFiles } from './import.ts';
 import { createInterface } from 'readline';
 import {
   isSyncable,
+  matchesAnyGlob,
   unsyncableReason,
   resolveSlugForPath,
   unacknowledgedSyncFailures,
@@ -238,11 +239,19 @@ export interface SyncResult {
 export function estimateSourceTreeTokens(
   localPath: string,
   strategy: 'markdown' | 'code' | 'auto',
+  exclude?: string[],
 ): { tokens: number; files: number } {
   let tokens = 0;
   let files = 0;
   try {
-    const fileList = collectSyncableFiles(localPath, { strategy });
+    let fileList = collectSyncableFiles(localPath, { strategy });
+    // PR-A/PR-B: mirror execution's file set — runImport drops --exclude globs
+    // (matched against walk-root-relative paths), so the ceiling estimate must
+    // too, else a junk-heavy subdir source (wiki `_*` control files) inflates
+    // the first-sync / chunker-drift $ preview and can needlessly auto-defer.
+    if (exclude && exclude.length > 0) {
+      fileList = fileList.filter(f => !matchesAnyGlob(relative(localPath, f), exclude));
+    }
     for (const fullPath of fileList) {
       try {
         const stat = statSync(fullPath);
@@ -383,8 +392,8 @@ export function estimateInlineNewTokens(
   let hadCeiling = false;
   const ceilingReasons: string[] = [];
 
-  const ceiling = (localPath: string, strategy: 'markdown' | 'code' | 'auto', reason: string) => {
-    tokens += estimateSourceTreeTokens(localPath, strategy).tokens;
+  const ceiling = (scopeRoot: string, strategy: 'markdown' | 'code' | 'auto', exclude: string[] | undefined, reason: string) => {
+    tokens += estimateSourceTreeTokens(scopeRoot, strategy, exclude).tokens;
     changedSources++;
     hadCeiling = true;
     ceilingReasons.push(reason);
@@ -392,27 +401,37 @@ export function estimateInlineNewTokens(
 
   for (const src of sources) {
     if (!src.local_path) continue;
-    const cfg = (src.config || {}) as { syncEnabled?: boolean; strategy?: 'markdown' | 'code' | 'auto' };
+    const cfg = (src.config || {}) as { syncEnabled?: boolean; strategy?: 'markdown' | 'code' | 'auto'; exclude?: unknown; srcSubpath?: unknown };
     if (cfg.syncEnabled === false) continue;
     const strategy = cfg.strategy ?? 'markdown';
     const localPath = src.local_path;
+    // PR-A/PR-B: honor the source's durable exclude/srcSubpath (config jsonb) so
+    // the estimate mirrors what execution imports (the estimator's whole design
+    // philosophy). scopeRoot narrows the ceiling walk to the subdir; exclude
+    // drops junk from both the ceiling walk and the delta filter.
+    const exclude = Array.isArray(cfg.exclude)
+      ? (cfg.exclude as unknown[]).filter((x): x is string => typeof x === 'string')
+      : undefined;
+    const scopeRoot = (typeof cfg.srcSubpath === 'string' && cfg.srcSubpath)
+      ? join(localPath, cfg.srcSubpath)
+      : localPath;
 
     // Rung 2: chunker drift forces a full re-chunk → full re-embed. CEILING.
     if (src.chunker_version !== currentChunkerVersion) {
-      ceiling(localPath, strategy, 'chunker_drift');
+      ceiling(scopeRoot, strategy, exclude, 'chunker_drift');
       continue;
     }
 
     // Rung 4 (early): no bookmark → first sync imports everything. CEILING.
     if (!src.last_commit) {
-      ceiling(localPath, strategy, 'first_sync');
+      ceiling(scopeRoot, strategy, exclude, 'first_sync');
       continue;
     }
 
     const resolved = resolveEstimateTarget(localPath);
     if (!resolved) {
       // HEAD unresolvable (not a git repo / gone) — can't compute a delta. CEILING.
-      ceiling(localPath, strategy, 'git_unavailable');
+      ceiling(scopeRoot, strategy, exclude, 'git_unavailable');
       continue;
     }
 
@@ -437,10 +456,12 @@ export function estimateInlineNewTokens(
       detachedManifest,
     });
     if (delta.status === 'unavailable') {
-      ceiling(localPath, strategy, 'git_unavailable');
+      ceiling(scopeRoot, strategy, exclude, 'git_unavailable');
       continue;
     }
-    const syncOpts = { strategy };
+    // PR-B: isSyncable's exclude arm drops the same globs runImport does, so an
+    // excluded file that changed doesn't get priced as new embed cost.
+    const syncOpts = { strategy, exclude };
     const changedPaths = unique([
       ...delta.manifest.added.filter(p => isSyncable(p, syncOpts)),
       ...delta.manifest.modified.filter(p => isSyncable(p, syncOpts)),
@@ -821,6 +842,23 @@ export interface SyncOpts {
    * Precedent: CycleOpts.signal at src/core/cycle.ts (v0.22.1 #403).
    */
   signal?: AbortSignal;
+  /**
+   * Monorepo subdir-source support (PR-A). Sync only files under this
+   * subdirectory of the git repo. When set, the git context root is still
+   * discovered from the nearest `.git/` ancestor (so git ops run at the repo
+   * root), but the file-walk + import scope are limited to this subpath, and
+   * slugs become git-root-relative (e.g. `wiki/page1`). Enables N logical
+   * sources in one git repo. Path-traversal (`../escape`, symlink-out) is
+   * rejected before any git op runs.
+   */
+  srcSubpath?: string;
+  /**
+   * Glob patterns for files to exclude from sync (repeatable via the CLI
+   * `--exclude <glob>` flag). Matched against scope-relative paths and
+   * threaded through to `runImport`'s exclude filter. Used by the wiki sync
+   * to drop `_`-prefixed control files / `_eval` / `_quarantine`.
+   */
+  exclude?: string[];
 }
 
 /**
@@ -903,6 +941,27 @@ function git(repoPath: string, args: string[], configs: string[] = []): string {
     timeout: 30000,
     maxBuffer: 100 * 1024 * 1024,
   }).trim();
+}
+
+/**
+ * Monorepo subdir-source support (PR-A). Walk up from inputPath to the nearest
+ * git repo root via `git -C <path> rev-parse --show-toplevel`. Handles
+ * worktrees and submodules natively (git resolves them). Throws a
+ * user-friendly error when no git repo is found. Atlas's wiki + agent-diary
+ * sources are subdirectories of the ~/atlas repo and depend on this to sync at
+ * all — vanilla gbrain's `existsSync(repoPath/.git)` check rejected them.
+ */
+function discoverGitRoot(inputPath: string): string {
+  try {
+    return execFileSync('git', ['-C', inputPath, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf-8',
+      timeout: 10000,
+    }).trim();
+  } catch {
+    throw new Error(
+      `Not inside a git repository: ${inputPath}. GBrain sync requires a git-initialized repo (or a subdirectory of one).`,
+    );
+  }
 }
 
 function hasOriginRemote(repoPath: string): boolean {
@@ -1522,6 +1581,18 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       typeof cfgRows[0]?.config === 'string'
         ? (JSON.parse(cfgRows[0].config as string) as Record<string, unknown>)
         : ((cfgRows[0]?.config ?? {}) as Record<string, unknown>);
+    // PR-B durable exclude: read exclude/srcSubpath from the source's config jsonb
+    // so EVERY sync path honors them — not just the CLI --exclude flag. Closes the
+    // gap where autopilot's freshness-sync (which passes only {sourceId, repoPath},
+    // no flags) bypassed the wiki cron's --exclude and re-ingested _-prefixed junk
+    // incl. the golden-10 answer-key (incident 2026-06-09). CLI-provided opts win.
+    if (!opts.exclude && Array.isArray(cfg.exclude)) {
+      const fromCfg = (cfg.exclude as unknown[]).filter((x): x is string => typeof x === 'string');
+      if (fromCfg.length > 0) opts.exclude = fromCfg;
+    }
+    if (!opts.srcSubpath && typeof cfg.srcSubpath === 'string' && cfg.srcSubpath) {
+      opts.srcSubpath = cfg.srcSubpath;
+    }
     const remoteUrl = typeof cfg.remote_url === 'string' ? cfg.remote_url : null;
     if (remoteUrl) {
       const ownSrc = {
@@ -1567,10 +1638,31 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     }
   }
 
-  // Validate git repo
-  if (!existsSync(join(repoPath, '.git'))) {
-    throw new Error(`Not a git repository: ${repoPath}. GBrain sync requires a git-initialized repo.`);
+  // Discover git root (PR-A monorepo subdir-source support). discoverGitRoot
+  // walks up from repoPath via `git -C <path> rev-parse --show-toplevel`, so a
+  // source whose local_path is a SUBDIRECTORY of a git repo (Atlas's wiki +
+  // agent diaries) syncs correctly. Git ops run at gitContextRoot; the file
+  // walk + import are scoped to syncScopeRoot. Back-compat: when repoPath IS
+  // the git root and no --src-subpath is set, gitContextRoot === syncScopeRoot
+  // === repoPath and behavior is identical to the old `.git` existsSync check.
+  const gitContextRoot = realpathSync(discoverGitRoot(repoPath));
+  const rawScopeRoot = opts.srcSubpath ? join(repoPath, opts.srcSubpath) : repoPath;
+  if (!existsSync(rawScopeRoot)) {
+    throw new Error(`Sync scope does not exist: ${rawScopeRoot}`);
   }
+  const syncScopeRoot = realpathSync(rawScopeRoot);
+  // NAV-1 scope-entry: verify syncScopeRoot is inside gitContextRoot. Catches
+  // `--src-subpath ../../../etc` path traversal (and symlink-out) before any
+  // git op runs.
+  if (!syncScopeRoot.startsWith(gitContextRoot + '/') && syncScopeRoot !== gitContextRoot) {
+    throw new Error(
+      `Sync scope ${syncScopeRoot} resolves outside git repo ${gitContextRoot}. ` +
+      `Refusing to sync: possible path traversal via --src-subpath.`,
+    );
+  }
+  // Relative path from git root to sync scope (empty string when no subpath /
+  // when the source is at the git root). Non-empty marks a subdir source.
+  const syncScopeRelPath = relative(gitContextRoot, syncScopeRoot);
 
   serr(`[gbrain phase] sync.detect_head`);
   // Detect detached HEAD up front so the working-tree fallback fires for both
@@ -1699,7 +1791,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // back to the authoritative full reconcile (which now also purges stale
       // pages for deleted files; see performFullSync's delete-reconcile pass).
       serr(`Sync anchor ${lastCommit.slice(0, 8)} object missing (gc'd after history rewrite). Running full reimport.`);
-      return performFullSync(engine, repoPath, headCommit, opts);
+      return performFullSync(engine, gitContextRoot, syncScopeRoot, headCommit, opts);
     }
 
     // Observability only — NOT control flow. A non-ancestor bookmark is still
@@ -1722,7 +1814,20 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
 
   // First sync
   if (!lastCommit) {
-    return performFullSync(engine, repoPath, headCommit, opts);
+    return performFullSync(engine, gitContextRoot, syncScopeRoot, headCommit, opts);
+  }
+
+  // PR-A: subdir-scoped sources (syncScopeRelPath non-empty — Atlas's wiki +
+  // agent diaries) ALWAYS take the full-reconcile path. The incremental
+  // diff/delete/rename/import machinery below (computeSyncDelta + the
+  // join(repoPath, ...) file ops) operates on git-root-relative paths against
+  // the WHOLE repo and is not subpath-aware; a full reconcile is authoritative
+  // + idempotent (content_hash skips unchanged files → no re-embed cost) and
+  // these sources are small (~100-180 files). Sources AT the git root
+  // (syncScopeRelPath === '') fall through to the unchanged incremental path,
+  // preserving full back-compat + the resumable-sync guarantees.
+  if (syncScopeRelPath) {
+    return performFullSync(engine, gitContextRoot, syncScopeRoot, headCommit, opts);
   }
 
   // v0.42.x (#1794): resumable incremental sync — resolve the PINNED target.
@@ -1802,7 +1907,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] chunker_version gate: stored=${storedVersion ?? 'unset'}, current=${currentVersion}. ` +
       `Forcing full re-chunk pass (git HEAD unchanged but pipeline version advanced).`,
     );
-    const result = await performFullSync(engine, repoPath, headCommit, opts);
+    const result = await performFullSync(engine, gitContextRoot, syncScopeRoot, headCommit, opts);
     await writeChunkerVersion(engine, opts.sourceId, currentVersion);
     return result;
   }
@@ -1831,7 +1936,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] delta ${lastCommit.slice(0, 8)}..${pin.slice(0, 8)} unavailable ` +
       `(${delta.reason}) — falling back to full reconcile.`,
     );
-    return performFullSync(engine, repoPath, headCommit, opts);
+    return performFullSync(engine, gitContextRoot, syncScopeRoot, headCommit, opts);
   }
   const manifest = delta.manifest;
 
@@ -2951,11 +3056,23 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
 
 async function performFullSync(
   engine: BrainEngine,
-  repoPath: string,
+  gitContextRoot: string,
+  syncScopeRoot: string,
   headCommit: string,
   opts: SyncOpts,
 ): Promise<SyncResult> {
-  // Dry-run: walk the repo, count syncable files, return without writing.
+  // PR-A: walk + import are scoped to syncScopeRoot (the subdir for a
+  // subdir-source, else == gitContextRoot). git ops run at gitContextRoot.
+  // slugRoot makes slugs git-root-relative ONLY when --src-subpath was
+  // explicitly provided (the monorepo case). Sources registered with a direct
+  // subdirectory local_path (Atlas's wiki/diaries — NO srcSubpath) keep slugs
+  // relative to the scope root → bare slugs (e.g. `agent-roster`), preserving
+  // their existing frontmatter-slug matching. The exclude/slug filtering is
+  // applied inside runImport (scope-relative match).
+  const fullScopeRel = relative(gitContextRoot, syncScopeRoot);
+  const slugRoot = (opts.srcSubpath && fullScopeRel) ? gitContextRoot : undefined;
+  const slugBase = slugRoot ?? syncScopeRoot;
+  // Dry-run: walk the scope, count syncable files, return without writing.
   // Fixes the silent-write-on-dry-run bug where performFullSync called
   // runImport unconditionally regardless of opts.dryRun.
   //
@@ -2965,11 +3082,17 @@ async function performFullSync(
   // code --dry-run` always reported zero files even when ~1500 code
   // files were waiting.
   if (opts.dryRun) {
-    const allFiles = collectSyncableFiles(repoPath, { strategy: opts.strategy ?? 'markdown' });
+    const walked = collectSyncableFiles(syncScopeRoot, { strategy: opts.strategy ?? 'markdown' });
+    // PR-B: match the real import predicate exactly — runImport excludes via
+    // matchesAnyGlob (NOT isSyncable, which would also drop metafiles the
+    // import keeps) — so dry-run counts what the run actually imports.
+    const allFiles = (opts.exclude && opts.exclude.length > 0)
+      ? walked.filter(abs => !matchesAnyGlob(relative(syncScopeRoot, abs), opts.exclude!))
+      : walked;
     slog(
       `Full-sync dry run (strategy=${opts.strategy ?? 'markdown'}): ` +
       `${allFiles.length} file(s) would be imported ` +
-      `from ${repoPath} @ ${headCommit.slice(0, 8)}.`,
+      `from ${syncScopeRoot} @ ${headCommit.slice(0, 8)}.`,
     );
     return {
       status: 'dry_run',
@@ -2992,21 +3115,25 @@ async function performFullSync(
   // sync and the jobs handler.
   const FULL_SYNC_LARGE_MARKER = Number.MAX_SAFE_INTEGER;
   const fullConcurrency = autoConcurrency(engine, FULL_SYNC_LARGE_MARKER, opts.concurrency);
-  slog(`Running full import of ${repoPath}${fullConcurrency > 1 ? ` (${fullConcurrency} workers)` : ''}...`);
+  slog(`Running full import of ${syncScopeRoot}${fullConcurrency > 1 ? ` (${fullConcurrency} workers)` : ''}...`);
   const { runImport } = await import('./import.ts');
-  const importArgs = [repoPath];
+  const importArgs = [syncScopeRoot];
   if (opts.noEmbed) importArgs.push('--no-embed');
   if (fullConcurrency > 1) importArgs.push('--workers', String(fullConcurrency));
   // v0.31.2: thread strategy through so code-strategy first sync
   // actually enumerates code files (closes bug 1).
   // v0.30.x: thread sourceId so performFullSync routes pages to the named
   // source (incremental path already does this).
+  // PR-A/PR-B: thread exclude (--exclude globs) + slugRoot (git-root-relative
+  // slugs only when --src-subpath set; undefined → scope-relative bare slugs).
   const _fullImportT0 = Date.now();
   serr(`[gbrain phase] sync.fullsync.import start strategy=${opts.strategy ?? 'markdown'}`);
   const result = await runImport(engine, importArgs, {
     commit: headCommit,
     strategy: opts.strategy,
     sourceId: opts.sourceId,
+    exclude: opts.exclude,
+    slugRoot,
     // issue #1939: performFullSync owns the failure ledger + bookmark via the
     // shared gate below; don't let runImport double-record or write its own.
     managedBookmark: true,
@@ -3030,9 +3157,9 @@ async function performFullSync(
   const advanceFull = async (): Promise<void> => {
     // Persist sync state so the next sync is incremental. Routed through
     // writeSyncAnchor so --source pins the right sources row.
-    await writeSyncAnchor(engine, opts.sourceId, 'last_commit', headCommit, newestCommitMs(repoPath));
+    await writeSyncAnchor(engine, opts.sourceId, 'last_commit', headCommit, newestCommitMs(gitContextRoot));
     await engine.setConfig('sync.last_run', new Date().toISOString());
-    await writeSyncAnchor(engine, opts.sourceId, 'repo_path', repoPath);
+    await writeSyncAnchor(engine, opts.sourceId, 'repo_path', syncScopeRoot);
     await writeChunkerVersion(engine, opts.sourceId, String(CHUNKER_VERSION));
   };
 
@@ -3059,7 +3186,7 @@ async function performFullSync(
       );
     }
     await engine.setConfig('sync.last_run', new Date().toISOString());
-    await writeSyncAnchor(engine, opts.sourceId, 'repo_path', repoPath);
+    await writeSyncAnchor(engine, opts.sourceId, 'repo_path', syncScopeRoot);
     return {
       status: 'blocked_by_failures',
       fromCommit: null,
@@ -3106,12 +3233,19 @@ async function performFullSync(
     const sid = opts.sourceId;
     const reconcileSyncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
     // collectSyncableFiles returns ABSOLUTE paths; source_path is stored
-    // repo-relative (importFile uses `relative(dir, filePath)`), so relativize
-    // to the same form before membership-testing — otherwise every page looks
-    // stale and the reconcile would wrongly delete live pages.
+    // relative to slugBase (importFile uses the relativePath runImport passed —
+    // scope-relative for direct subdir sources, git-root-relative under
+    // --src-subpath), so relativize to slugBase before membership-testing —
+    // otherwise every page looks stale and the reconcile would wrongly delete
+    // live pages. PR-B: when --exclude is set, an excluded file is NOT in
+    // `current`, so its previously-imported page becomes reconcile-eligible —
+    // this is what makes `--exclude '_*'` durably purge junk pages (e.g. the
+    // wiki `_eval`/`_quarantine` control files) on each full sync.
     const current = new Set(
-      collectSyncableFiles(repoPath, { strategy: opts.strategy ?? 'markdown' })
-        .map(abs => relative(repoPath, abs)),
+      collectSyncableFiles(syncScopeRoot, { strategy: opts.strategy ?? 'markdown' })
+        .filter(abs => !opts.exclude || opts.exclude.length === 0
+          || !matchesAnyGlob(relative(syncScopeRoot, abs), opts.exclude))
+        .map(abs => relative(slugBase, abs)),
     );
     const rows = await engine.executeRaw<{ slug: string; source_path: string | null }>(
       `SELECT slug, source_path FROM pages WHERE source_id = $1 AND source_path IS NOT NULL AND deleted_at IS NULL`,
@@ -3122,7 +3256,26 @@ async function performFullSync(
         && isSyncable(r.source_path, reconcileSyncOpts)
         && !current.has(r.source_path))
       .map(r => r.slug);
-    if (staleSlugs.length > 0) {
+    // Mass-deletion circuit-breaker (PR-A safety). A full sync that just walked
+    // the scope should never find the ENTIRE (or most of the) source stale. If
+    // it does — `current` is empty while pages exist, or >50% of file-backed
+    // pages would be deleted — the scope/slug base is almost certainly
+    // miscomputed (e.g. a realpath/base mismatch between the walk and the
+    // stored source_path), NOT a real bulk removal. Refuse the reconcile and
+    // leave the source intact rather than wipe it; the import already ran, so
+    // no data is lost by skipping the delete pass. Guards the only data-loss-
+    // capable code path in this change.
+    const fileBackedPages = rows.filter(r => r.source_path != null).length;
+    const wouldDeleteMost = staleSlugs.length > 0
+      && (current.size === 0 || staleSlugs.length > fileBackedPages * 0.5);
+    if (wouldDeleteMost) {
+      serr(
+        `[sync] reconcile-delete ABORTED for source ${sid}: ${staleSlugs.length}/${fileBackedPages} ` +
+        `file-backed page(s) would be deleted (scope files found=${current.size}). Refusing — this ` +
+        `looks like a scope/slug-base mismatch, not a real bulk file removal. Source left intact; ` +
+        `investigate before re-syncing.`,
+      );
+    } else if (staleSlugs.length > 0) {
       const deleteScopedOpts = { sourceId: sid };
       for (let i = 0; i < staleSlugs.length; i += DELETE_BATCH_SIZE) {
         const batch = staleSlugs.slice(i, i + DELETE_BATCH_SIZE);
@@ -3360,6 +3513,15 @@ See also:
   const skipFailed = args.includes('--skip-failed');
   const retryFailed = args.includes('--retry-failed');
   const noSchemaPack = args.includes('--no-schema-pack'); // v0.41.37.0 #1569
+  // PR-A/PR-B: monorepo subdir-source flags. --src-subpath scopes the sync to
+  // a subdirectory of the git repo (git-root-relative slugs); --exclude is a
+  // repeatable glob filter (the wiki sync uses `--exclude '_*' --exclude '_*/**'`
+  // to drop control files). Parsed here, threaded into SyncOpts below.
+  const srcSubpath = args.find((a, i) => args[i - 1] === '--src-subpath') || undefined;
+  const exclude: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--exclude' && i + 1 < args.length) exclude.push(args[i + 1]);
+  }
   const syncAll = args.includes('--all');
   const jsonOut = args.includes('--json');
   const yesFlag = args.includes('--yes');
@@ -3916,6 +4078,8 @@ See also:
   const opts: SyncOpts = {
     repoPath, dryRun, full, noPull, noEmbed, noExtract, skipFailed, retryFailed, noSchemaPack, sourceId,
     strategy: strategyArg, concurrency,
+    srcSubpath,
+    exclude: exclude.length > 0 ? exclude : undefined,
     signal: composeAbortSignals(singleSourceInterrupt.signal, singleSourceController?.signal),
   };
 
@@ -4517,6 +4681,18 @@ export function manageGitignore(
   if (process.env.GBRAIN_NO_GITIGNORE === '1') {
     return;
   }
+
+  // PR-A: skip .gitignore management for subdir sources. A subdir source's
+  // local_path is inside a SHARED repo (Atlas's wiki/diaries live under
+  // ~/atlas, which other agents commit to); auto-writing gbrain ignore rules
+  // into that shared root's .gitignore is an unwanted cross-agent write, and a
+  // stray .gitignore inside the subdir is also wrong. Only manage .gitignore
+  // when the source IS the git root (the upstream single-repo case). Best-
+  // effort: a non-git path falls through to the existing no-git handling below.
+  try {
+    const gitRoot = discoverGitRoot(repoPath);
+    if (realpathSync(gitRoot) !== realpathSync(repoPath)) return;
+  } catch { /* not a git path — fall through to existing handling */ }
 
   // Submodule + worktree detection (closes #889 misclassification).
   // Both submodules and worktrees use `.git` as a FILE (not a directory), so

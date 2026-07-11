@@ -11,6 +11,7 @@ import {
   isCodeFilePath,
   isMarkdownFilePath,
   isImageFilePath as isImageFilePathFromSync,
+  matchesAnyGlob,
   pruneDir,
   type SyncStrategy,
 } from '../core/sync.ts';
@@ -45,7 +46,22 @@ export interface RunImportResult {
 export async function runImport(
   engine: BrainEngine,
   args: string[],
-  opts: { commit?: string; strategy?: SyncStrategy; sourceId?: string; managedBookmark?: boolean } = {},
+  opts: {
+    commit?: string;
+    strategy?: SyncStrategy;
+    sourceId?: string;
+    managedBookmark?: boolean;
+    /** PR-B: glob patterns to exclude (matched against walk-root-relative paths). */
+    exclude?: string[];
+    /**
+     * PR-A: when set, slugs (and source_path) are computed relative to this
+     * root instead of the walk dir — used by performFullSync's --src-subpath
+     * path so a subdir walk yields git-root-relative slugs (e.g. `wiki/page1`).
+     * Undefined (the default + every direct-subdir Atlas source) → slugs stay
+     * relative to the walk dir (bare).
+     */
+    slugRoot?: string;
+  } = {},
 ): Promise<RunImportResult> {
   const noEmbed = args.includes('--no-embed');
   const fresh = args.includes('--fresh');
@@ -176,7 +192,19 @@ export async function runImport(
   const strategy: SyncStrategy = opts.strategy ?? 'markdown';
   const _walkT0 = Date.now();
   console.error(`[gbrain phase] import.collect_files start dir=${dir} strategy=${strategy}`);
-  const allFiles = collectSyncableFiles(dir, { strategy });
+  let allFiles = collectSyncableFiles(dir, { strategy });
+  // PR-B: apply --exclude globs (matched against walk-root-relative paths).
+  // NAV-4: warn when the patterns exclude everything (likely a bad glob).
+  if (opts.exclude && opts.exclude.length > 0) {
+    const beforeCount = allFiles.length;
+    allFiles = allFiles.filter(f => !matchesAnyGlob(relative(dir, f), opts.exclude!));
+    if (beforeCount > 0 && allFiles.length === 0) {
+      console.warn(
+        `[gbrain sync] No files matched after applying ${opts.exclude.length} --exclude pattern(s). ` +
+        `Check your --exclude flags. Patterns: ${JSON.stringify(opts.exclude)}`,
+      );
+    }
+  }
   console.error(
     `[gbrain phase] import.collect_files done ${Date.now() - _walkT0}ms files=${allFiles.length}`,
   );
@@ -227,7 +255,12 @@ export async function runImport(
   }
 
   async function processFile(eng: BrainEngine, filePath: string) {
+    // `relativePath` (walk-root-relative) keys checkpoint/resume + failure
+    // ledger + slow-path logs (unchanged). PR-A: `slugPath` is what becomes the
+    // slug + source_path — git-root-relative when slugRoot is set (--src-subpath),
+    // else identical to relativePath (every direct-subdir Atlas source).
     const relativePath = relative(dir, filePath);
+    const slugPath = opts.slugRoot ? relative(opts.slugRoot, filePath) : relativePath;
     // v0.31.2 (D5): per-file slow-path log. Fires only when a single
     // file takes >5s. The user's hang surfaces as one file taking
     // forever — without this, the agent can't see which file.
@@ -238,8 +271,8 @@ export async function runImport(
       // up images when GBRAIN_EMBEDDING_MULTIMODAL=true so this branch is
       // unreachable when the gate is off; defense-in-depth check anyway.
       const result = isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
-        ? await importImageFile(eng, filePath, relativePath, { noEmbed, sourceId })
-        : await importFile(eng, filePath, relativePath, { noEmbed, sourceId, activePack: importActivePack });
+        ? await importImageFile(eng, filePath, slugPath, { noEmbed, sourceId })
+        : await importFile(eng, filePath, slugPath, { noEmbed, sourceId, activePack: importActivePack });
       const _fileMs = Date.now() - _fileT0;
       if (_fileMs > 5000) {
         console.error(`[gbrain phase] import.process_file slow ${_fileMs}ms ${relativePath}`);
