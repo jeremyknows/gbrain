@@ -88,6 +88,21 @@ describe('manageGitignore', () => {
     expect(content).toContain('media/articles/');
   });
 
+  test('subdir-scoped (--src-subpath) source: shared root .gitignore is NOT managed', () => {
+    // PR-A: a --src-subpath source has repoPath == the git root (post the
+    // repo_path-anchor fix), so the gitRoot===repoPath check alone would wrongly
+    // manage the SHARED monorepo root .gitignore. The srcSubpath arg must force
+    // the subdir-scope skip. Pre-fix (no srcSubpath param) this wrote .gitignore.
+    writeStorageConfig();
+    manageGitignore(tmp, undefined, 'wiki');
+    expect(existsSync(join(tmp, '.gitignore'))).toBe(false);
+    // Control: identical config, no srcSubpath → .gitignore IS written. Proves
+    // the storage config would have triggered a write, so the skip above is
+    // specifically due to srcSubpath, not an absent/empty config.
+    manageGitignore(tmp, undefined, undefined);
+    expect(existsSync(join(tmp, '.gitignore'))).toBe(true);
+  });
+
   test('idempotent — running twice does NOT duplicate entries', () => {
     writeStorageConfig();
     manageGitignore(tmp);

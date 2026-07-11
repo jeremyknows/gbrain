@@ -3848,7 +3848,8 @@ See also:
     const onAllSigint = () => { try { allInterrupt.abort(new Error('SIGINT')); } catch { /* */ } };
 
     const runOne = async (src: typeof sources[number]): Promise<SyncResult> => {
-      const cfg = (src.config || {}) as { strategy?: 'markdown' | 'code' | 'auto' };
+      const cfg = (src.config || {}) as { strategy?: 'markdown' | 'code' | 'auto'; srcSubpath?: unknown };
+      const cfgSrcSubpath = typeof cfg.srcSubpath === 'string' && cfg.srcSubpath ? cfg.srcSubpath : undefined;
       // D18: parallel path defers embed; auto-enqueue embed-backfill after.
       // v0.42.42.0 (#2139): `autoDeferEmbeds` (the inline gate tripped in a
       // non-TTY session) ALSO forces deferral — global by design (the gate's
@@ -3912,7 +3913,7 @@ See also:
         result.status !== 'blocked_by_failures' &&
         result.status !== 'partial'
       ) {
-        manageGitignore(src.local_path!, engine.kind);
+        manageGitignore(src.local_path!, engine.kind, cfgSrcSubpath);
       }
       // D18: auto-enqueue embed-backfill per source (unless opted out).
       // v0.41.13.0 (T7 / D-V3-5): partial excluded — the next clean sync
@@ -4105,6 +4106,28 @@ See also:
     signal: composeAbortSignals(singleSourceInterrupt.signal, singleSourceController?.signal),
   };
 
+  // PR-A: resolve the EFFECTIVE src-subpath for manageGitignore's subdir-scope
+  // skip. Prefer the CLI flag; else fall back to the source's durable
+  // config.srcSubpath. Resolved HERE (not from opts.srcSubpath post-sync)
+  // because watch mode calls performSync with a SPREAD copy (`{ ...opts }`), so
+  // performSyncInner's config-merge mutation never reaches this `opts` object —
+  // reading config directly is robust across both the watch and non-watch paths.
+  let effectiveSrcSubpath = srcSubpath;
+  if (!effectiveSrcSubpath && sourceId) {
+    try {
+      const scfg = await engine.executeRaw<{ config: Record<string, unknown> | string | null }>(
+        `SELECT config FROM sources WHERE id = $1`,
+        [sourceId],
+      );
+      const parsed = typeof scfg[0]?.config === 'string'
+        ? (JSON.parse(scfg[0].config as string) as Record<string, unknown>)
+        : ((scfg[0]?.config ?? {}) as Record<string, unknown>);
+      if (typeof parsed.srcSubpath === 'string' && parsed.srcSubpath) {
+        effectiveSrcSubpath = parsed.srcSubpath;
+      }
+    } catch { /* best-effort — a config read blip just leaves the CLI value */ }
+  }
+
   // v0.42.42.0 (#2139, Step 4b): single-source `gbrain sync` gets the SAME
   // inline cost gate as `--all`. Previously single-source embedded inline with
   // NO gate (only rail: the ≤100-file inline cap). Single-source always embeds
@@ -4185,7 +4208,7 @@ See also:
     ) {
       const effectiveRepoPath = opts.repoPath ?? (await getDefaultSourcePath(engine));
       if (effectiveRepoPath) {
-        manageGitignore(effectiveRepoPath, engine.kind);
+        manageGitignore(effectiveRepoPath, engine.kind, effectiveSrcSubpath);
       }
     }
     // v0.42.42.0 (#2139, Step 4b): the inline gate auto-deferred this run's
@@ -4234,7 +4257,7 @@ See also:
       ) {
         const effectiveRepoPath = opts.repoPath ?? (await getDefaultSourcePath(engine));
         if (effectiveRepoPath) {
-          manageGitignore(effectiveRepoPath, engine.kind);
+          manageGitignore(effectiveRepoPath, engine.kind, effectiveSrcSubpath);
         }
       }
     } catch (e: unknown) {
@@ -4699,18 +4722,32 @@ export function __resetPGLiteTierWarn(): void {
 export function manageGitignore(
   repoPath: string,
   engineKind?: 'pglite' | 'postgres',
+  // PR-A: the source's effective sync sub-path (CLI --src-subpath or durable
+  // config.srcSubpath), when the caller can supply it. Non-empty means the
+  // sync SCOPE is a proper subdirectory of the git root even though repoPath
+  // may BE the git root (the --src-subpath case) — so .gitignore management
+  // must be skipped just like a direct-subdir source.
+  srcSubpath?: string,
 ): void {
   if (process.env.GBRAIN_NO_GITIGNORE === '1') {
     return;
   }
 
-  // PR-A: skip .gitignore management for subdir sources. A subdir source's
-  // local_path is inside a SHARED repo (Atlas's wiki/diaries live under
-  // ~/atlas, which other agents commit to); auto-writing gbrain ignore rules
-  // into that shared root's .gitignore is an unwanted cross-agent write, and a
-  // stray .gitignore inside the subdir is also wrong. Only manage .gitignore
-  // when the source IS the git root (the upstream single-repo case). Best-
-  // effort: a non-git path falls through to the existing no-git handling below.
+  // PR-A: skip .gitignore management for subdir-SCOPED sources. A subdir
+  // source's effective scope is inside a SHARED repo (Atlas's wiki/diaries live
+  // under ~/atlas, which other agents commit to); auto-writing gbrain ignore
+  // rules into that shared root's .gitignore is an unwanted cross-agent write,
+  // and a stray .gitignore inside the subdir is also wrong. Two subdir shapes:
+  //   1. direct-subdir source — repoPath itself is below the git root
+  //      (gitRoot !== repoPath).
+  //   2. --src-subpath source — repoPath IS the git root, but srcSubpath scopes
+  //      the sync below it. (Post the repo_path-anchor fix, such a source stores
+  //      its git-root local_path, so the gitRoot===repoPath check alone would
+  //      wrongly manage the shared root .gitignore.)
+  // Only manage .gitignore when the source IS the git root AND syncs the whole
+  // repo (the upstream single-repo case). Best-effort: a non-git path falls
+  // through to the existing no-git handling below.
+  if (srcSubpath) return;
   try {
     const gitRoot = discoverGitRoot(repoPath);
     if (realpathSync(gitRoot) !== realpathSync(repoPath)) return;
