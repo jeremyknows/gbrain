@@ -1791,7 +1791,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // back to the authoritative full reconcile (which now also purges stale
       // pages for deleted files; see performFullSync's delete-reconcile pass).
       serr(`Sync anchor ${lastCommit.slice(0, 8)} object missing (gc'd after history rewrite). Running full reimport.`);
-      return performFullSync(engine, gitContextRoot, syncScopeRoot, headCommit, opts);
+      return performFullSync(engine, repoPath, gitContextRoot, syncScopeRoot, headCommit, opts);
     }
 
     // Observability only — NOT control flow. A non-ancestor bookmark is still
@@ -1814,7 +1814,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
 
   // First sync
   if (!lastCommit) {
-    return performFullSync(engine, gitContextRoot, syncScopeRoot, headCommit, opts);
+    return performFullSync(engine, repoPath, gitContextRoot, syncScopeRoot, headCommit, opts);
   }
 
   // PR-A: subdir-scoped sources (syncScopeRelPath non-empty — Atlas's wiki +
@@ -1827,7 +1827,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // (syncScopeRelPath === '') fall through to the unchanged incremental path,
   // preserving full back-compat + the resumable-sync guarantees.
   if (syncScopeRelPath) {
-    return performFullSync(engine, gitContextRoot, syncScopeRoot, headCommit, opts);
+    return performFullSync(engine, repoPath, gitContextRoot, syncScopeRoot, headCommit, opts);
   }
 
   // v0.42.x (#1794): resumable incremental sync — resolve the PINNED target.
@@ -1907,7 +1907,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] chunker_version gate: stored=${storedVersion ?? 'unset'}, current=${currentVersion}. ` +
       `Forcing full re-chunk pass (git HEAD unchanged but pipeline version advanced).`,
     );
-    const result = await performFullSync(engine, gitContextRoot, syncScopeRoot, headCommit, opts);
+    const result = await performFullSync(engine, repoPath, gitContextRoot, syncScopeRoot, headCommit, opts);
     await writeChunkerVersion(engine, opts.sourceId, currentVersion);
     return result;
   }
@@ -1936,12 +1936,22 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] delta ${lastCommit.slice(0, 8)}..${pin.slice(0, 8)} unavailable ` +
       `(${delta.reason}) — falling back to full reconcile.`,
     );
-    return performFullSync(engine, gitContextRoot, syncScopeRoot, headCommit, opts);
+    return performFullSync(engine, repoPath, gitContextRoot, syncScopeRoot, headCommit, opts);
   }
   const manifest = delta.manifest;
 
-  // Filter to syncable files (strategy-aware)
-  const syncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
+  // Filter to syncable files (strategy-aware + PR-B exclude-aware). Including
+  // exclude here keeps the incremental (git-root source) path's imported set
+  // consistent with the cost estimator's delta prediction (which now honors
+  // exclude) and with 74e8f8af's "EVERY sync path honors durable exclude"
+  // intent. An excluded-modified file resolves to `exclude-glob-hit` (NOT
+  // `metafile`) in the #1433 cleanup below, so its previously-imported page is
+  // purged — the same purge semantics as the full-reconcile path. Only git-root
+  // sources reach here (subdir sources full-sync), so scope-relative ==
+  // git-root-relative and the exclude glob basis matches.
+  const syncOpts = (opts.strategy || opts.exclude?.length)
+    ? { strategy: opts.strategy, exclude: opts.exclude }
+    : undefined;
   // #1970 (F-C): a rename whose DESTINATION is unsyncable drops out of BOTH
   // `renamed` (only `r.to` is kept below) AND `deleted` (git emits it as `R`,
   // not `D`), leaving the OLD page stale. Fold the source side into the delete
@@ -3056,6 +3066,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
 
 async function performFullSync(
   engine: BrainEngine,
+  // `repoPath` is the source's ORIGINAL registered local_path (pre-subpath-join)
+  // — persisted verbatim to the repo_path anchor so the next run reads back the
+  // same pre-join path and re-derives the scope from config.srcSubpath. Writing
+  // syncScopeRoot here instead would double-join (/repo/wiki → /repo/wiki/wiki)
+  // and break every subsequent srcSubpath sync. NOT interchangeable with
+  // gitContextRoot: for a direct-subdir source repoPath is the subdir while
+  // gitContextRoot is the repo root.
+  repoPath: string,
   gitContextRoot: string,
   syncScopeRoot: string,
   headCommit: string,
@@ -3159,7 +3177,10 @@ async function performFullSync(
     // writeSyncAnchor so --source pins the right sources row.
     await writeSyncAnchor(engine, opts.sourceId, 'last_commit', headCommit, newestCommitMs(gitContextRoot));
     await engine.setConfig('sync.last_run', new Date().toISOString());
-    await writeSyncAnchor(engine, opts.sourceId, 'repo_path', syncScopeRoot);
+    // Persist the ORIGINAL local_path (pre-subpath-join), NOT syncScopeRoot —
+    // else a srcSubpath source stores /repo/wiki and the next run re-joins the
+    // config subpath onto it (/repo/wiki/wiki) → "Sync scope does not exist".
+    await writeSyncAnchor(engine, opts.sourceId, 'repo_path', repoPath);
     await writeChunkerVersion(engine, opts.sourceId, String(CHUNKER_VERSION));
   };
 
@@ -3186,7 +3207,8 @@ async function performFullSync(
       );
     }
     await engine.setConfig('sync.last_run', new Date().toISOString());
-    await writeSyncAnchor(engine, opts.sourceId, 'repo_path', syncScopeRoot);
+    // Original local_path (pre-join), see advanceFull — never syncScopeRoot.
+    await writeSyncAnchor(engine, opts.sourceId, 'repo_path', repoPath);
     return {
       status: 'blocked_by_failures',
       fromCommit: null,

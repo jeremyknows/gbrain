@@ -278,4 +278,84 @@ describe('sync monorepo subdir-source support (PR-A+B)', () => {
     const hasExcludeWarn = warnMessages.some(m => m.includes('--exclude') || m.includes('No files matched'));
     expect(hasExcludeWarn).toBe(true);
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Cross-run invariant (FIX 1): repo_path anchor must persist the pre-join
+  // local_path, NOT syncScopeRoot — else run 2 re-joins config.srcSubpath onto
+  // the already-scoped path (/repo/wiki → /repo/wiki/wiki) and throws.
+  // Reproduces on a REGISTERED source (local_path + config.srcSubpath), which
+  // is the production shape; tests the SECOND run (the invariant is cross-run).
+  // ─────────────────────────────────────────────────────────────────────────
+
+  test('cross-run: srcSubpath source syncs twice without double-joining the subpath', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // Register a monorepo source: local_path = git root, config.srcSubpath = wiki.
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+         VALUES ('mono-wiki', 'mono-wiki', $1, $2)
+         ON CONFLICT (id) DO UPDATE SET local_path = $1, config = $2`,
+      [repoPath, JSON.stringify({ srcSubpath: 'wiki' })],
+    );
+
+    const first = await performSync(engine, { sourceId: 'mono-wiki', noPull: true, noEmbed: true, full: true });
+    expect(first.status).toBe('first_sync');
+    expect(first.added).toBe(2); // wiki/page1 + wiki/page2, scoped to the subdir
+
+    // The repo_path anchor (sources.local_path) MUST stay the pre-join root.
+    // Under the pre-fix bug it became /repo/wiki here, which breaks run 2.
+    const rows = await engine.executeRaw<{ local_path: string }>(
+      `SELECT local_path FROM sources WHERE id = 'mono-wiki'`,
+    );
+    expect(rows[0].local_path).toBe(repoPath);
+
+    // Run 2 must NOT throw "Sync scope does not exist" and must stay scoped to
+    // wiki/ (bare re-derivation of the same subdir from config.srcSubpath).
+    const second = await performSync(engine, { sourceId: 'mono-wiki', noPull: true, noEmbed: true });
+    expect(['first_sync', 'synced', 'up_to_date']).toContain(second.status);
+    expect(await engine.getPage('wiki/page1')).not.toBeNull();
+    expect(await engine.getPage('memory/note1')).toBeNull();
+    // local_path is STILL the pre-join root after run 2 (no drift).
+    const rows2 = await engine.executeRaw<{ local_path: string }>(
+      `SELECT local_path FROM sources WHERE id = 'mono-wiki'`,
+    );
+    expect(rows2[0].local_path).toBe(repoPath);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Incremental exclude (FIX 2): a git-root source with durable exclude config
+  // takes the incremental path on its 2nd sync; a newly-committed excluded file
+  // must NOT be imported (plan==apply — the estimator now honors exclude too).
+  // ─────────────────────────────────────────────────────────────────────────
+
+  test('incremental: durable exclude drops a newly-committed excluded file (git-root source)', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // git-root source (local_path = repo root, NO srcSubpath → incremental path
+    // on run 2), with a durable exclude glob in config.
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+         VALUES ('root-src', 'root-src', $1, $2)
+         ON CONFLICT (id) DO UPDATE SET local_path = $1, config = $2`,
+      [repoPath, JSON.stringify({ exclude: ['secret-*.md'] })],
+    );
+
+    const first = await performSync(engine, { sourceId: 'root-src', noPull: true, noEmbed: true, full: true });
+    expect(first.status).toBe('first_sync');
+    expect(first.added).toBe(4); // the 4 base files, none excluded
+
+    // Commit a NEW file that matches the exclude glob.
+    writeFileSync(join(repoPath, 'secret-note.md'), mdPage('Secret Note'));
+    gitCommit(repoPath, 'add excluded file');
+
+    // Run 2 goes through the incremental (git-root) path. The excluded file must
+    // be filtered out of the import set (pre-fix: syncOpts omitted exclude, so
+    // it was imported — plan!=apply once the estimator started honoring exclude).
+    const second = await performSync(engine, { sourceId: 'root-src', noPull: true, noEmbed: true });
+    // With the fix, the only delta file is excluded → 0 syncable changes →
+    // 'up_to_date'. Pre-fix it was imported → 'synced'. The load-bearing check
+    // is that the excluded page never lands, regardless of status label.
+    expect(['up_to_date', 'synced']).toContain(second.status);
+    expect(await engine.getPage('secret-note')).toBeNull();
+    // The pre-existing pages are untouched.
+    expect(await engine.getPage('wiki/page1')).not.toBeNull();
+  });
 });
