@@ -16,6 +16,7 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'fs';
+import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { collectSyncableFiles } from '../src/commands/import.ts';
@@ -159,6 +160,24 @@ describe('collectSyncableFiles symlink + cycle hardening', () => {
       expect(first.map(f => f.replace(tmp, ''))).toEqual([
         '/a.md', '/b.md', '/sub/c.md',
       ]);
+    });
+  });
+
+  test('8. GBRAIN_SYNC_FORCE_FS_WALK includes gitignored diary files', async () => {
+    execFileSync('git', ['init'], { cwd: tmp, stdio: 'ignore' });
+    writeFileSync(join(tmp, '.gitignore'), '*\n');
+    writeFileSync(join(tmp, 'tracked.md'), 'tracked\n');
+    execFileSync('git', ['add', '-f', 'tracked.md'], { cwd: tmp, stdio: 'ignore' });
+    writeFileSync(join(tmp, 'ignored.md'), 'ignored\n');
+
+    await withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: undefined, GBRAIN_SYNC_FORCE_FS_WALK: undefined }, () => {
+      const gitAware = collectSyncableFiles(tmp, { strategy: 'markdown' });
+      expect(gitAware.map(f => f.replace(tmp, '')).sort()).toEqual(['/tracked.md']);
+    });
+
+    await withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: undefined, GBRAIN_SYNC_FORCE_FS_WALK: '1' }, () => {
+      const forced = collectSyncableFiles(tmp, { strategy: 'markdown' });
+      expect(forced.map(f => f.replace(tmp, '')).sort()).toEqual(['/ignored.md', '/tracked.md']);
     });
   });
 });

@@ -611,6 +611,7 @@ function gitListSyncableFiles(
 export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): string[] {
   const strategy: SyncStrategy = opts.strategy ?? 'markdown';
   const multimodalOn = process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true';
+  const forceFsWalk = process.env.GBRAIN_SYNC_FORCE_FS_WALK === '1';
 
   // v0.42.x (#1159 --respect-gitignore / #1483 .gbrainignore): when `dir` is a
   // git work tree, enumerate via `git ls-files` so the walk honors
@@ -621,8 +622,10 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
   // vendored data/fixtures). `--cached --others --exclude-standard` = tracked
   // PLUS untracked-not-ignored, so uncommitted source is still indexed. Non-git
   // dirs (or git unavailable) fall through to the FS walk below.
-  const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn);
-  if (gitFiles) return gitFiles;
+  if (!forceFsWalk) {
+    const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn);
+    if (gitFiles) return gitFiles;
+  }
 
   const maxDepth = resolveMaxWalkDepth();
   const visitedInodes = new Map<string, true>();
