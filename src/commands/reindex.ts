@@ -89,7 +89,12 @@ function parseArgs(args: string[]): ReindexOpts {
     } else if (a === '--repo') {
       out.repoPath = args[++i];
     } else if (a === '--source' || a === '--source-id') {
-      out.sourceId = args[++i];
+      const value = args[i + 1];
+      if (!value || value.startsWith('--')) {
+        throw new Error(`${a} requires a non-empty source ID`);
+      }
+      out.sourceId = value;
+      i++;
     } else if (a === '--workers' || a === '--concurrency') {
       // v0.41.15.0 (T10, D9): per-batch parallel workers.
       const v = parseInt(args[++i] ?? '', 10);

@@ -64,6 +64,20 @@ describe('gbrain reindex --markdown (v0.32.7)', () => {
     expect(Number(rows.find(row => row.source_id === 'other-source')?.chunker_version)).toBe(1);
   });
 
+  test('source flags fail closed when their value is missing or empty', async () => {
+    for (const flag of ['--source', '--source-id']) {
+      await expect(runReindex(engine, ['--markdown', '--dry-run', flag])).rejects.toThrow(
+        `${flag} requires a non-empty source ID`,
+      );
+      await expect(runReindex(engine, ['--markdown', '--dry-run', flag, ''])).rejects.toThrow(
+        `${flag} requires a non-empty source ID`,
+      );
+      await expect(runReindex(engine, ['--markdown', flag, '--dry-run'])).rejects.toThrow(
+        `${flag} requires a non-empty source ID`,
+      );
+    }
+  });
+
   test('dry-run reports pending count and does not write', async () => {
     await seedLegacyPage('note-a', 'body a');
     await seedLegacyPage('note-b', 'body b');
