@@ -28,16 +28,42 @@ beforeEach(async () => {
   await (engine as any).db.exec('DELETE FROM pages');
 });
 
-async function seedLegacyPage(slug: string, body: string, sourcePath: string | null = null) {
+async function seedLegacyPage(
+  slug: string,
+  body: string,
+  sourcePath: string | null = null,
+  sourceId = 'default',
+) {
   // Force chunker_version=1 explicitly to simulate a pre-bump row.
   await engine.executeRaw(
-    `INSERT INTO pages (slug, type, title, compiled_truth, page_kind, chunker_version, source_path)
-     VALUES ($1, 'note', $2, $3, 'markdown', 1, $4)`,
-    [slug, slug.split('/').pop() ?? slug, body, sourcePath],
+    `INSERT INTO pages (slug, type, title, compiled_truth, page_kind, chunker_version, source_path, source_id)
+     VALUES ($1, 'note', $2, $3, 'markdown', 1, $4, $5)`,
+    [slug, slug.split('/').pop() ?? slug, body, sourcePath, sourceId],
   );
 }
 
 describe('gbrain reindex --markdown (v0.32.7)', () => {
+  test('--source scopes both the pending count and the reindex batch', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('wiki', 'wiki'), ('other-source', 'other-source')
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await seedLegacyPage('wiki-note', 'wiki body', null, 'wiki');
+    await seedLegacyPage('other-note', 'other body', null, 'other-source');
+
+    const preview = await runReindex(engine, ['--markdown', '--source', 'wiki', '--dry-run']);
+    expect(preview.pending).toBe(1);
+
+    const result = await runReindex(engine, ['--markdown', '--source', 'wiki', '--no-embed']);
+    expect(result.reindexed).toBe(1);
+
+    const rows = await engine.executeRaw<{ source_id: string; chunker_version: number }>(
+      `SELECT source_id, chunker_version FROM pages ORDER BY source_id`,
+    );
+    expect(Number(rows.find(row => row.source_id === 'wiki')?.chunker_version)).toBe(MARKDOWN_CHUNKER_VERSION);
+    expect(Number(rows.find(row => row.source_id === 'other-source')?.chunker_version)).toBe(1);
+  });
+
   test('dry-run reports pending count and does not write', async () => {
     await seedLegacyPage('note-a', 'body a');
     await seedLegacyPage('note-b', 'body b');
