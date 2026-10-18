@@ -14,7 +14,6 @@ import type { ChunkInput, PageInput, PageType } from './types.ts';
 import { computeEffectiveDate } from './effective-date.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
 import { logSlugFallback } from './audit-slug-fallback.ts';
-import { resolveContextualRetrievalMode } from './contextual-retrieval-resolver.ts';
 import { assessContentSanity, ContentSanityBlockError } from './content-sanity.ts';
 import { loadOperatorLiterals } from './content-sanity-literals.ts';
 import { logContentSanityAssessment } from './audit/content-sanity-audit.ts';
@@ -27,17 +26,14 @@ import {
   isQuarantined,
 } from './quarantine.ts';
 import { loadConfig, loadConfigWithEngine } from './config.ts';
-import {
-  buildContextualPrefix,
-  modeRequiresHaiku,
-  modeRequiresWrapper,
-  sanitizeTitle,
-  wrapChunkForEmbedding,
-} from './embedding-context.ts';
-import { loadSearchModeConfig, resolveSearchMode } from './search/mode.ts';
 import { normalizeAliasList } from './search/alias-normalize.ts';
+import {
+  type InlineCRShape,
+  embeddingInputsFor,
+  loadInlineCRKnobs,
+  resolveInlineCRShape,
+} from './inline-cr-shape.ts';
 import { isUndefinedTableError, warnOncePerProcess } from './utils.ts';
-import { computeCorpusGeneration } from './contextual-retrieval-service.ts';
 import { runGuardrails } from './guardrails.ts';
 
 /**
@@ -672,38 +668,24 @@ export async function importFromContent(
   //   and defers per-chunk synopsis to the Minion-driven sweep).
   // - Stored chunk_text stays canonical; only the embedding input is wrapped.
   // - Code chunks (chunk_source='fenced_code') bypass wrapping per D20-T4.
-  let effectiveCRMode: 'none' | 'title' | 'per_chunk_synopsis' = 'none';
+  // Resolution, prefix and corpus_generation come from inline-cr-shape.ts,
+  // which the deferred embed passes share, so a noEmbed import followed by
+  // an embed pass ends up exactly where an inline import would. Title-tier
+  // wrap is free; per_chunk_synopsis is demoted to title here and the
+  // Minion-driven contextual reindex upgrades it later.
+  let crShape: InlineCRShape | null = null;
   if (!opts.noEmbed) {
-    const searchInput = await loadSearchModeConfig(engine);
-    const knobs = resolveSearchMode(searchInput);
-    // Look up the source row for this import; default to host trust when
-    // the engine's getConfig path doesn't surface a source row (most calls).
-    const resolution = resolveContextualRetrievalMode({
-      pageFrontmatter: parsed.frontmatter,
-      source: {
-        id: sourceId ?? 'default',
-        contextual_retrieval_mode: null,
-        trust_frontmatter_overrides: false,
-      },
-      globalMode: knobs.contextual_retrieval,
-      killSwitchDisabled: knobs.contextual_retrieval_disabled,
+    crShape = resolveInlineCRShape({
+      frontmatter: parsed.frontmatter,
+      title: parsed.title,
+      sourceId,
+      knobs: await loadInlineCRKnobs(engine),
     });
-    // Inline path: title-tier wrap is free. per_chunk_synopsis is too
-    // expensive for the inline import path; the page lands at the
-    // title tier on disk and the Minion-driven contextual reindex
-    // upgrades it later when the user accepts the cost prompt.
-    effectiveCRMode = resolution.mode === 'per_chunk_synopsis' ? 'title' : resolution.mode;
   }
+  const effectiveCRMode = crShape?.mode ?? 'none';
 
   if (!opts.noEmbed && chunks.length > 0) {
-    const safeTitle = sanitizeTitle(parsed.title);
-    const prefix =
-      modeRequiresWrapper(effectiveCRMode) && !modeRequiresHaiku(effectiveCRMode)
-        ? buildContextualPrefix(safeTitle, null)
-        : null;
-    const wrappedTexts = prefix
-      ? chunks.map((c) => wrapChunkForEmbedding(c.chunk_text, prefix, c.chunk_source))
-      : chunks.map((c) => c.chunk_text);
+    const wrappedTexts = embeddingInputsFor(chunks, crShape);
     const embeddings = await embedBatch(wrappedTexts);
     for (let i = 0; i < chunks.length; i++) {
       chunks[i].embedding = embeddings[i];
@@ -716,13 +698,7 @@ export async function importFromContent(
   // v0.40.3.0: corpus_generation hash for D27 P1-5 cache invalidation.
   // Only set when we actually applied a wrapper; 'none' tier writes NULL
   // so the column reflects "no CR shape applied" rather than a stale hash.
-  const corpusGeneration =
-    effectiveCRMode === 'none' || opts.noEmbed
-      ? null
-      : computeCorpusGeneration({
-          crMode: effectiveCRMode,
-          haikuModel: 'anthropic:claude-haiku-4-5-20251001',
-        });
+  const corpusGeneration = opts.noEmbed ? null : (crShape?.corpusGeneration ?? null);
 
   // Transaction wraps all DB writes. Every per-page tx call carries the
   // caller's sourceId so writes target (sourceId, slug) rather than the
@@ -779,7 +755,8 @@ export async function importFromContent(
     // the page write. updatePageContextualRetrievalState is a narrow
     // UPDATE that runs after putPage's INSERT/UPDATE so the row exists.
     // For opts.noEmbed callers, we skip stamping — the next embed pass
-    // (gbrain embed --stale or contextual reindex Minion) will set it.
+    // (gbrain embed --stale or contextual reindex Minion) will set it,
+    // through stampInlineCRShape once every chunk is embedded.
     if (!opts.noEmbed) {
       await tx.updatePageContextualRetrievalState(
         slug,

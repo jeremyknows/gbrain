@@ -22,6 +22,17 @@ import type { ChunkInput } from './types.ts';
 import { embedBatchWithBackoff } from '../commands/embed.ts';
 import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
 import { AbortError } from './abort-check.ts';
+import {
+  type InlineCRKnobs,
+  embeddingInputsFor,
+  loadInlineCRKnobs,
+  type PassCoverage,
+  inlineCRShapeId,
+  pageFullyEmbeddedThisPass,
+  prunePassCoverage,
+  pageInlineCRShape,
+  stampInlineCRShape,
+} from './inline-cr-shape.ts';
 
 /** Last visited (page_id, chunk_index) for keyset-resume across runs. */
 export interface StaleCursor {
@@ -133,6 +144,25 @@ export async function embedStaleForSource(
   };
   const signature = opts.embeddingSignature;
 
+  // Contextual-retrieval knobs, loaded once per run. Each page is embedded
+  // with the title wrapper the inline import would have used, and stamped
+  // once all its chunks are embedded, so a noEmbed import followed by this
+  // pass ends where an inline import does (cf-ops-258). A config read
+  // failure falls back to the old raw-text, no-stamp behaviour, loudly.
+  // Chunk indexes embedded per page in this call; a page's stale chunks can
+  // straddle keyset batches, so coverage is judged on the whole call.
+  const crCoverage: PassCoverage = new Map();
+  let crKnobs: InlineCRKnobs | null = null;
+  try {
+    crKnobs = await loadInlineCRKnobs(engine);
+  } catch (e: unknown) {
+    process.stderr.write(
+      `\n  [embed-stale] contextual-retrieval config unreadable; embedding raw text without stamping: ${
+        e instanceof Error ? e.message : String(e)
+      }\n`,
+    );
+  }
+
   // v0.41.31: invalidate embeddings stamped under a prior model signature so
   // the NULL cursor below re-embeds them. GRANDFATHER: NULL signature
   // untouched. Best-effort — a failure here must not abort the backfill.
@@ -189,8 +219,11 @@ export async function embedStaleForSource(
       const keySourceId = stale[0]?.source_id ?? sourceId;
       const slug = stale[0].slug;
       try {
+        const crShape = await observed(pacer, () =>
+          pageInlineCRShape(engine, slug, keySourceId, crKnobs),
+        );
         const embeddings = await embedFn(
-          stale.map((c) => c.chunk_text),
+          embeddingInputsFor(stale, crShape),
           { abortSignal: signal },
         );
         const existing = await observed(pacer, () =>
@@ -212,10 +245,19 @@ export async function embedStaleForSource(
         // re-embedded this pass) — a partially-stale page keeps preserved
         // chunks of unknown provenance, so don't claim current. After the
         // invalidate pass above, signature-drifted pages ARE fully stale.
-        if (signature && stale.length === existing.length) {
+        // Both stamps need the whole page embedded in this call, judged
+        // across keyset batches (a page's stale chunks can straddle them).
+        // A partially stale page keeps its old stamps.
+        const full = pageFullyEmbeddedThisPass(
+          crCoverage, key, inlineCRShapeId(crShape), stale.map((c) => c.chunk_index), existing,
+        );
+        if (signature && full) {
           await observed(pacer, () =>
             engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
           );
+        }
+        if (crShape && full) {
+          await observed(pacer, () => stampInlineCRShape(engine, slug, keySourceId, crShape));
         }
         result.embedded += stale.length;
         result.pagesProcessed += 1;
@@ -249,6 +291,7 @@ export async function embedStaleForSource(
 
     const numWorkers = Math.min(concurrency, keys.length);
     await Promise.all(Array.from({ length: numWorkers }, () => worker()));
+    prunePassCoverage(crCoverage, `${last.source_id}::${last.slug}`);
 
     if (opts.onProgress) {
       opts.onProgress({

@@ -19,6 +19,37 @@ import {
 } from '../core/pace-mode.ts';
 import { tryAcquireDbLock, type DbLockHandle } from '../core/db-lock.ts';
 import { embedBackfillLockId } from '../core/embed-backfill-lock.ts';
+import {
+  type InlineCRKnobs,
+  embeddingInputsFor,
+  loadInlineCRKnobs,
+  type PassCoverage,
+  inlineCRShapeId,
+  pageFullyEmbeddedThisPass,
+  prunePassCoverage,
+  pageInlineCRShape,
+  resolveInlineCRShape,
+  stampInlineCRShape,
+} from '../core/inline-cr-shape.ts';
+
+/**
+ * Contextual-retrieval knobs for an embed pass. Every path below embeds with
+ * the title wrapper the inline import would have used and stamps the page
+ * once all its chunks are embedded, so a noEmbed import (the autopilot
+ * cycle's sync phase) followed by this pass ends where an inline import does
+ * (cf-ops-258). A config read failure keeps the old raw-text, no-stamp
+ * behaviour, and says so.
+ */
+async function loadCRKnobsOrWarn(engine: BrainEngine): Promise<InlineCRKnobs | null> {
+  try {
+    return await loadInlineCRKnobs(engine);
+  } catch (e: unknown) {
+    serr(`[embed] contextual-retrieval config unreadable; embedding raw text without stamping: ${
+      e instanceof Error ? e.message : e
+    }`);
+    return null;
+  }
+}
 
 export interface EmbedOpts {
   /** Embed ALL pages (every chunk). */
@@ -576,7 +607,11 @@ async function embedPage(
     return;
   }
 
-  const embeddings = await embedBatch(toEmbed.map(c => c.chunk_text), { abortSignal: signal });
+  // Resolve against the same source the chunk reads and the stamp use
+  // (getChunks defaults to 'default'). `page` above came from an unscoped
+  // lookup, which can match a same-slug page in another source.
+  const crShape = await pageInlineCRShape(engine, slug, sourceId ?? 'default', await loadCRKnobsOrWarn(engine));
+  const embeddings = await embedBatch(embeddingInputsFor(toEmbed, crShape), { abortSignal: signal });
   const embeddingMap = new Map<number, Float32Array>();
   for (let j = 0; j < toEmbed.length; j++) {
     embeddingMap.set(toEmbed[j].chunk_index, embeddings[j]);
@@ -599,6 +634,7 @@ async function embedPage(
   // such a page and then stamps it.
   if (toEmbed.length === chunks.length) {
     await engine.setPageEmbeddingSignature(slug, { sourceId, signature: currentEmbeddingSignature() });
+    if (crShape) await stampInlineCRShape(engine, slug, sourceId, crShape);
   }
   result.embedded += toEmbed.length;
   result.pages_processed++;
@@ -650,6 +686,9 @@ async function embedAll(
   // --all path: pacer (no-op when off). E-1: lower the worker count to the
   // resolved cap instead of adding a separate permit.
   const pacer = staleOpts?.pacer ?? createNoopPacer();
+  // CR knobs load on the first page that actually embeds (none on dry runs).
+  let crKnobsP: Promise<InlineCRKnobs | null> | null = null;
+  const crKnobs = () => (crKnobsP ??= loadCRKnobsOrWarn(engine));
 
   // v0.31.12: when sourceId is set, scope listPages to that source.
   // v0.41 (D8 + Codex r2 #11): apply embed-skip filter via the shared
@@ -711,7 +750,12 @@ async function embedAll(
     }
 
     try {
-      const embeddings = await embedBatch(toEmbed.map(c => c.chunk_text));
+      // listPages already returned the title and frontmatter for this row.
+      const knobs = await crKnobs();
+      const crShape = knobs
+        ? resolveInlineCRShape({ frontmatter: page.frontmatter, title: page.title, sourceId: pageSourceId, knobs })
+        : null;
+      const embeddings = await embedBatch(embeddingInputsFor(toEmbed, crShape));
       // Build a map of new embeddings by chunk_index
       const embeddingMap = new Map<number, Float32Array>();
       for (let j = 0; j < toEmbed.length; j++) {
@@ -731,6 +775,10 @@ async function embedAll(
       await observed(pacer, () =>
         engine.setPageEmbeddingSignature(page.slug, { sourceId: pageSourceId, signature }),
       );
+      // --all re-embeds every chunk, so the page now has one known shape.
+      if (crShape) {
+        await observed(pacer, () => stampInlineCRShape(engine, page.slug, pageSourceId, crShape));
+      }
       result.embedded += toEmbed.length;
     } catch (e: unknown) {
       serr(`\n  Error embedding ${page.slug}: ${e instanceof Error ? e.message : e}`);
@@ -845,6 +893,13 @@ async function embedAllStale(
     slog(`[dry-run] Would embed ${staleCount} stale chunks`);
     return;
   }
+
+  // Loaded once per run, only when there is something to embed.
+  const crKnobs = await loadCRKnobsOrWarn(engine);
+  // Chunk indexes embedded per page during this pass. Keyset pages can split
+  // one page's stale chunks across batches, so "fully embedded" is judged on
+  // the whole pass, not on one batch.
+  const crCoverage: PassCoverage = new Map();
 
   // v0.33.3: cursor-paginated stale loading. Instead of pulling all 48K+
   // rows in one query (which times out on Supabase's 2-min pooler timeout),
@@ -1005,7 +1060,8 @@ async function embedAllStale(
         const keySourceId = stale[0]?.source_id ?? 'default';
         const slug = stale[0].slug;
         try {
-          const embeddings = await embedBatchWithBackoff(stale.map(c => c.chunk_text), { abortSignal: effectiveSignal });
+          const crShape = await observed(pacer, () => pageInlineCRShape(engine, slug, keySourceId, crKnobs));
+          const embeddings = await embedBatchWithBackoff(embeddingInputsFor(stale, crShape), { abortSignal: effectiveSignal });
           // Re-fetch existing chunks and merge to avoid deleting non-stale chunks.
           const existing = await observed(pacer, () => engine.getChunks(slug, { sourceId: keySourceId }));
           const staleIdxToEmbedding = new Map<number, Float32Array>();
@@ -1025,10 +1081,19 @@ async function embedAllStale(
           // A partially-stale page keeps preserved chunks of unknown/old
           // provenance, so don't claim it's current. (After invalidate, a
           // signature-drifted page IS fully stale → this stamps it.)
-          if (signature && stale.length === existing.length) {
+          // Both stamps need the whole page embedded in this pass, judged
+          // across keyset batches (a page's stale chunks can straddle them).
+          // A partially stale page keeps its old stamps.
+          const full = pageFullyEmbeddedThisPass(
+            crCoverage, key, inlineCRShapeId(crShape), stale.map(c => c.chunk_index), existing,
+          );
+          if (signature && full) {
             await observed(pacer, () =>
               engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
             );
+          }
+          if (crShape && full) {
+            await observed(pacer, () => stampInlineCRShape(engine, slug, keySourceId, crShape));
           }
           result.embedded += stale.length;
         } catch (e: unknown) {
@@ -1068,6 +1133,8 @@ async function embedAllStale(
         onItem: (key) => embedOneKey(key),
         failureLabel: (key) => key,
       });
+      // Only the batch's last page can continue into the next batch.
+      prunePassCoverage(crCoverage, `${last.source_id}::${last.slug}`);
 
       // E-4: extend the work budget by any paced-sleep time accrued this batch.
       rearmBudgetForPacing();
